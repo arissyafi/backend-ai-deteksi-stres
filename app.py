@@ -11,23 +11,46 @@ import gc
 
 # Inisialisasi Flask
 app = Flask(__name__)
-CORS(app) # Penting agar Vercel bisa akses
+CORS(app)
 
-# --- KONFIGURASI MODEL ---
+# --- KONFIGURASI ---
 MODEL_FILE = 'OTAK_AI_100FILE_FINAL.pkl'
+ALLOWED_EXTENSIONS = {'edf'}
+TARGET_CHANNELS = ['AF3', 'T7', 'Pz', 'T8', 'AF4'] # Channel Wajib
+
 model_data = None
 
-# Load model di awal (Global)
+# Load model saat startup
 if os.path.exists(MODEL_FILE):
     try:
         model_data = joblib.load(MODEL_FILE)
-        print("✅ Model berhasil dimuat saat startup.")
+        print("✅ Model berhasil dimuat.")
     except Exception as e:
         print(f"❌ Gagal memuat model: {e}")
 else:
-    print(f"⚠️ Peringatan: File {MODEL_FILE} tidak ditemukan di server.")
+    print(f"⚠️ Peringatan: File {MODEL_FILE} tidak ditemukan.")
 
-# --- FUNGSI EKSTRAKSI (SAMA PERSIS) ---
+# --- FUNGSI BANTUAN ---
+def allowed_file(filename):
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def normalize_channel_names(raw):
+    """
+    Fungsi pintar untuk menebak nama channel yang agak beda.
+    Misal: 'EEG AF3' -> 'AF3', 'af-3' -> 'AF3'
+    """
+    mapping = {}
+    for ch in raw.ch_names:
+        clean_name = ch.upper().replace('EEG', '').replace('-', '').strip()
+        # Mapping nama asli ke nama bersih jika cocok dengan target
+        if clean_name in TARGET_CHANNELS:
+            mapping[ch] = clean_name
+    
+    if mapping:
+        raw.rename_channels(mapping)
+    return raw
+
 def hjorth_params(data):
     diff1 = np.diff(data)
     diff2 = np.diff(diff1)
@@ -45,6 +68,7 @@ def extract_features_complete(data, fs=128):
     features = []
     bands = {'Delta': (0.5, 4), 'Theta': (4, 8), 'Alpha': (8, 13),
              'Beta': (13, 30), 'Gamma': (30, 45)}
+    
     for channel_data in data:
         features.extend([np.mean(channel_data), np.std(channel_data), 
                          skew(channel_data), kurtosis(channel_data)])
@@ -61,67 +85,75 @@ def extract_features_complete(data, fs=128):
 
 @app.route('/', methods=['GET'])
 def home():
-    return "NeuroSense API is Running! (v2.0 Fix)"
+    return "NeuroSense API v3.0 (Secure & Flexible)"
 
 @app.route('/predict', methods=['POST'])
 def predict():
     # 1. Cek Model
     if model_data is None:
-        return jsonify({'error': 'Model AI tidak ditemukan di server'}), 500
+        return jsonify({'error': 'Server Error: Model AI belum siap.'}), 500
 
-    # 2. Cek File
+    # 2. Cek File Ada/Tidak
     if 'file' not in request.files:
-        return jsonify({'error': 'Tidak ada file dikirim'}), 400
+        return jsonify({'error': 'Harap upload file.'}), 400
     
     file = request.files['file']
+    
+    # 3. Cek Nama File & Ekstensi
     if file.filename == '':
-        return jsonify({'error': 'Nama file kosong'}), 400
+        return jsonify({'error': 'Nama file kosong.'}), 400
+        
+    if not allowed_file(file.filename):
+        return jsonify({'error': 'Format salah! Hanya menerima file .edf'}), 400
 
-    # 3. Simpan File ke Folder Sementara (/tmp)
-    # PENTING: Di Render/Cloud, kita tidak boleh tulis di root directory sembarangan
+    # Simpan sementara
     try:
-        temp_dir = '/tmp' 
-        if not os.path.exists(temp_dir):
-            os.makedirs(temp_dir)
-            
+        temp_dir = '/tmp'
+        if not os.path.exists(temp_dir): os.makedirs(temp_dir)
         file_path = os.path.join(temp_dir, file.filename)
         file.save(file_path)
-        print(f"📁 File disimpan sementara di: {file_path}")
-
     except Exception as e:
-        print(f"❌ Error Saving File: {e}")
-        return jsonify({'error': f"Gagal menyimpan file: {str(e)}"}), 500
+        return jsonify({'error': f"Gagal upload: {str(e)}"}), 500
 
-    # 4. Proses AI (Dalam Try-Except agar error terlihat jelas)
     try:
         knn = model_data['model_knn']
         scaler = model_data['scaler']
         idx_fitur = model_data['fitur_idx']
 
-        # Baca EDF
-        # preload=True bisa memakan RAM, tapi untuk file kecil (beberapa MB) di Render biasanya masih aman.
-        # Jika file >10MB, pertimbangkan preload=False atau potong durasi.
-        raw = mne.io.read_raw_edf(file_path, preload=True, verbose=False)
+        # --- LANGKAH BACA & VALIDASI CHANNEL ---
+        try:
+            raw = mne.io.read_raw_edf(file_path, preload=True, verbose=False)
+        except Exception:
+            raise ValueError("File rusak atau bukan format EDF valid.")
+
+        # Normalisasi nama channel (Handling nama aneh)
+        raw = normalize_channel_names(raw)
         
-        # Preprocessing
+        # Cek Channel yang Ada
+        available = raw.ch_names
+        
+        # Logika Fleksibilitas:
+        # Cari mana channel target yang ada di file ini
+        found_channels = [ch for ch in TARGET_CHANNELS if ch in available]
+        missing_channels = list(set(TARGET_CHANNELS) - set(found_channels))
+
+        # JIKA KURANG DARI 5: Tolak dengan pesan jelas
+        if len(missing_channels) > 0:
+            raise ValueError(f"Channel tidak lengkap. Kurang: {', '.join(missing_channels)}. Wajib ada 5 channel: AF3, T7, Pz, T8, AF4.")
+
+        # JIKA LEBIH DARI 5: Ambil hanya yang dibutuhkan (Buang sisanya)
+        raw.pick_channels(TARGET_CHANNELS)
+        
+        # --- PROSES STANDAR ---
         raw.filter(1.0, 45.0, fir_design='firwin', verbose=False)
-        if raw.info['sfreq'] != 128: raw.resample(128, verbose=False)
+        if raw.info['sfreq'] != 128: 
+            raw.resample(128, verbose=False)
         
-        tgt_chs = ['AF3', 'T7', 'Pz', 'T8', 'AF4']
-        current_chs = raw.ch_names
-        picked = [ch for ch in tgt_chs if ch in current_chs]
-        
-        if len(picked) < 3:
-            raise ValueError(f"Channel tidak cukup. Ditemukan: {picked}")
-            
-        raw.pick_channels(picked)
-        
-        # Epoching
         epochs = mne.make_fixed_length_epochs(raw, duration=2.0, overlap=1.0, verbose=False)
         data_signal = epochs.get_data()
-        
+
         if len(data_signal) == 0:
-            raise ValueError("File valid tapi data sinyal kosong.")
+            raise ValueError("File valid tapi durasi terlalu pendek (min 2 detik).")
 
         # Ekstraksi
         fitur_mentah = []
@@ -129,11 +161,11 @@ def predict():
             feat = extract_features_complete(data_signal[i])
             fitur_mentah.append(feat)
         
-        fitur_mentah = np.array(fitur_mentah)
-        
-        # Seleksi & Prediksi
-        fitur_terpilih = fitur_mentah[:, idx_fitur] 
-        fitur_final = scaler.transform(fitur_terpilih)
+        fitur_mentah = np.array(fitur_mentah) 
+
+        # Scale -> Select -> Predict
+        fitur_scaled = scaler.transform(fitur_mentah) 
+        fitur_final = fitur_scaled[:, idx_fitur]
         hasil_prediksi = knn.predict(fitur_final)
         
         # Voting
@@ -141,29 +173,30 @@ def predict():
         persen_stres = (jumlah_stres / len(hasil_prediksi)) * 100
         status_akhir = "STRES" if persen_stres > 50 else "RILEKS"
         
-        # Bersihkan File & Memori
+        # Cleanup
         if os.path.exists(file_path): os.remove(file_path)
         del raw, epochs, data_signal
         gc.collect()
         
-        print(f"✅ Sukses Prediksi: {status_akhir} ({persen_stres:.2f}%)")
-        
         return jsonify({
             'filename': file.filename,
             'result': status_akhir,
-            'confidence': round(persen_stres, 2) if status_akhir == "STRES" else round(100-persen_stres, 2)
+            'confidence': round(persen_stres, 2) if status_akhir == "STRES" else round(100-persen_stres, 2),
+            'channel_used': TARGET_CHANNELS
         })
 
-    except Exception as e:
-        # PENTING: Ini akan mencetak error detail ke Logs Render
-        error_msg = traceback.format_exc()
-        print("❌ CRITICAL ERROR DI PROSES AI:")
-        print(error_msg)
-        
-        # Hapus file jika masih ada
+    except ValueError as ve:
+        # Error Validasi (Channel kurang, file rusak)
         if os.path.exists(file_path): os.remove(file_path)
+        return jsonify({'error': str(ve)}), 400
         
-        return jsonify({'error': f"Server Error: {str(e)}"}), 500
+    except Exception as e:
+        # Error Server Lainnya
+        error_msg = traceback.format_exc()
+        print("❌ CRITICAL ERROR:")
+        print(error_msg)
+        if os.path.exists(file_path): os.remove(file_path)
+        return jsonify({'error': "Terjadi kesalahan internal pada server."}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
